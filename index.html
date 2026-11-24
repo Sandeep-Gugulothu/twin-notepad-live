@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Cloud Notepad (Mobile Twin)</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+        body {
+            background-color: #18181b;
+            color: #d4d4d8;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        /* Top Bar matching desktop Notepad */
+        .header {
+            background: #202024;
+            height: 44px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0 12px;
+            border-bottom: 1px solid #2e2e38;
+        }
+        .title {
+            font-size: 13px;
+            font-weight: 700;
+            color: #e4e4e7;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .badges {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .badge {
+            font-size: 11px;
+            font-weight: 700;
+            padding: 3px 8px;
+            border-radius: 4px;
+        }
+        .badge-live {
+            background: #14532d;
+            color: #4ade80;
+        }
+        .badge-affinity {
+            background: #3b0764;
+            color: #d8b4fe;
+            border: 1px solid #7e22ce;
+            cursor: pointer;
+        }
+
+        /* Channel Bar */
+        .channel-bar {
+            background: #18181b;
+            padding: 6px 12px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            border-bottom: 1px solid #27272a;
+            font-size: 12px;
+        }
+        .channel-bar input {
+            background: #27272a;
+            border: 1px solid #3f3f46;
+            color: #fff;
+            padding: 4px 8px;
+            border-radius: 4px;
+            flex: 1;
+            font-size: 12px;
+            outline: none;
+        }
+        .channel-bar button {
+            background: #0284c7;
+            color: #fff;
+            border: none;
+            padding: 4px 10px;
+            border-radius: 4px;
+            font-weight: 600;
+            cursor: pointer;
+        }
+
+        /* Editor Area */
+        .editor-container {
+            flex: 1;
+            display: flex;
+            position: relative;
+        }
+        textarea {
+            width: 100%;
+            height: 100%;
+            background-color: #121214;
+            color: #f4f4f5;
+            font-family: "Cascadia Code", "Consolas", monospace;
+            font-size: 15px;
+            line-height: 1.5;
+            padding: 14px;
+            border: none;
+            outline: none;
+            resize: none;
+            tab-size: 4;
+        }
+
+        /* Bottom Floating Bar */
+        .bottom-bar {
+            background: #202024;
+            height: 32px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0 12px;
+            font-size: 11px;
+            color: #a1a1aa;
+            border-top: 1px solid #2e2e38;
+        }
+        .status-text {
+            color: #4ade80;
+            font-weight: 600;
+        }
+    </style>
+</head>
+<body>
+
+    <div class="header">
+        <div class="title">
+            <span>📝 Cloud Notepad (Mobile Twin)</span>
+        </div>
+        <div class="badges">
+            <span id="affinityBadge" class="badge badge-affinity" onclick="toggleAffinity()">WDA: 0x11</span>
+            <span id="syncBadge" class="badge badge-live">● SYNCED</span>
+        </div>
+    </div>
+
+    <div class="channel-bar">
+        <span style="color:#888;">Room:</span>
+        <input type="text" id="channelInput" value="notepad_room_8821">
+        <button onclick="setChannel()">Join</button>
+    </div>
+
+    <div class="editor-container">
+        <textarea id="editor" spellcheck="false" placeholder="Loading twin notepad..."></textarea>
+    </div>
+
+    <div class="bottom-bar">
+        <span id="charCount">0 characters</span>
+        <span id="statusIndicator" class="status-text">Connected to Global Cloud</span>
+    </div>
+
+    <script>
+        let channel = localStorage.getItem('twin_channel') || 'notepad_room_8821';
+        document.getElementById('channelInput').value = channel;
+
+        const editor = document.getElementById('editor');
+        const statusIndicator = document.getElementById('statusIndicator');
+        const syncBadge = document.getElementById('syncBadge');
+        const affinityBadge = document.getElementById('affinityBadge');
+        const charCount = document.getElementById('charCount');
+
+        let localRevision = 0;
+        let remoteRevision = 0;
+        let isApplyingRemote = false;
+        let broadcastTimer = null;
+        let currentAffinity = "0x11";
+        let eventSource = null;
+
+        function setChannel() {
+            channel = document.getElementById('channelInput').value.trim();
+            localStorage.setItem('twin_channel', channel);
+            restartStream();
+        }
+
+        // Live Bi-directional Typing Listener
+        editor.addEventListener('input', () => {
+            if (isApplyingRemote) return;
+            localRevision++;
+            updateStats();
+
+            clearTimeout(broadcastTimer);
+            broadcastTimer = setTimeout(() => {
+                broadcastLocalChange();
+            }, 120); // Low-latency debounce
+        });
+
+        function updateStats() {
+            charCount.textContent = `${editor.value.length} characters`;
+        }
+
+        function broadcastLocalChange() {
+            const text = editor.value;
+            const rev = localRevision;
+
+            // Unicode safe base64 encoding
+            const b64 = btoa(unescape(encodeURIComponent(text)));
+            const packet = `REV:${rev}:TEXT:${b64}`;
+
+            publishPayload(packet);
+            syncBadge.textContent = "↑ PUSHING...";
+            setTimeout(() => { syncBadge.textContent = "● SYNCED"; }, 300);
+        }
+
+        async function publishPayload(payload) {
+            try {
+                await fetch(`https://ntfy.sh/${channel}`, {
+                    method: 'POST',
+                    body: payload
+                });
+            } catch (err) {
+                console.error("Sync error:", err);
+            }
+        }
+
+        function toggleAffinity() {
+            currentAffinity = (currentAffinity === '0x11') ? '0x00' : '0x11';
+            affinityBadge.textContent = `WDA: ${currentAffinity}`;
+            publishPayload(`CMD:AFFINITY:${currentAffinity}`);
+        }
+
+        // Listen for live updates coming from the candidate's laptop
+        function restartStream() {
+            if (eventSource) {
+                eventSource.close();
+            }
+
+            // ntfy.sh SSE global stream
+            const streamUrl = `https://ntfy.sh/${channel}/sse`;
+            eventSource = new EventSource(streamUrl);
+
+            eventSource.onopen = () => {
+                statusIndicator.textContent = "Connected to Global Cloud";
+                statusIndicator.style.color = "#4ade80";
+            };
+
+            eventSource.onmessage = (event) => {
+                try {
+                    const data = JSON.parse(event.data);
+                    const line = data.message;
+                    if (!line) return;
+
+                    if (line.startsWith("CMD:AFFINITY:")) {
+                        const aff = line.replace("CMD:AFFINITY:", "").trim();
+                        currentAffinity = aff;
+                        affinityBadge.textContent = `WDA: ${aff}`;
+                    } else if (line.startsWith("REV:")) {
+                        // Packet format: REV:<number>:TEXT:<base64>
+                        const firstColon = 4;
+                        const secondColon = line.indexOf(":TEXT:", firstColon);
+                        if (secondColon !== -1) {
+                            const revStr = line.substring(firstColon, secondColon);
+                            const incomingRev = parseInt(revStr, 10);
+                            const b64 = line.substring(secondColon + 6);
+                            const incomingText = decodeURIComponent(escape(atob(b64)));
+
+                            if (incomingRev > remoteRevision && editor.value !== incomingText) {
+                                remoteRevision = incomingRev;
+                                localRevision = incomingRev;
+
+                                isApplyingRemote = true;
+                                const selStart = editor.selectionStart;
+                                const selEnd = editor.selectionEnd;
+
+                                editor.value = incomingText;
+
+                                // Preserve phone cursor position
+                                editor.setSelectionRange(selStart, selEnd);
+                                isApplyingRemote = false;
+                                updateStats();
+
+                                syncBadge.textContent = "↓ RECEIVED";
+                                setTimeout(() => { syncBadge.textContent = "● SYNCED"; }, 300);
+                            }
+                        }
+                    }
+                } catch (e) {
+                    console.error("Error processing stream:", e);
+                }
+            };
+
+            eventSource.onerror = () => {
+                statusIndicator.textContent = "Reconnecting...";
+                statusIndicator.style.color = "#f59e0b";
+            };
+        }
+
+        restartStream();
+    </script>
+</body>
+</html>
