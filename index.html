@@ -153,6 +153,7 @@
     </div>
 
     <script>
+        const clientId = 'mob_' + Math.random().toString(36).substring(2, 8);
         let channel = localStorage.getItem('twin_channel') || 'notepad_room_8821';
         document.getElementById('channelInput').value = channel;
 
@@ -166,6 +167,7 @@
         let remoteRevision = 0;
         let isApplyingRemote = false;
         let broadcastTimer = null;
+        let lastLocalEdit = 0;
         let currentAffinity = "0x00";
         let eventSource = null;
 
@@ -181,13 +183,14 @@
         // Live Bi-directional Typing Listener
         editor.addEventListener('input', () => {
             if (isApplyingRemote) return;
+            lastLocalEdit = Date.now();
             localRevision++;
             updateStats();
 
             clearTimeout(broadcastTimer);
             broadcastTimer = setTimeout(() => {
                 broadcastLocalChange();
-            }, 120); // 120ms debounce: sends entire text document in 1 burst
+            }, 250); // 250ms debounce: sends entire text document in 1 burst
         });
 
         function updateStats() {
@@ -200,7 +203,7 @@
 
             // Unicode safe base64
             const b64 = btoa(unescape(encodeURIComponent(text)));
-            const packet = `REV:${rev}:TEXT:${b64}`;
+            const packet = `REV:${rev}:FROM:${clientId}:TEXT:${b64}`;
 
             publishPayload(packet);
             syncBadge.textContent = "↑ PUSHING...";
@@ -290,24 +293,37 @@
                         affinityBadge.textContent = `WDA: ${aff}`;
                     } else if (line.startsWith("REV:")) {
                         const firstColon = 4;
-                        const secondColon = line.indexOf(":TEXT:", firstColon);
-                        if (secondColon !== -1) {
-                            const revStr = line.substring(firstColon, secondColon);
+                        const textMarker = line.indexOf(":TEXT:", firstColon);
+                        if (textMarker !== -1) {
+                            let senderId = "";
+                            const fromMarker = line.indexOf(":FROM:", firstColon);
+                            let revStr;
+                            if (fromMarker !== -1 && fromMarker < textMarker) {
+                                revStr = line.substring(firstColon, fromMarker);
+                                senderId = line.substring(fromMarker + 6, textMarker);
+                            } else {
+                                revStr = line.substring(firstColon, textMarker);
+                            }
+
+                            if (senderId === clientId) return;
+                            if (Date.now() - lastLocalEdit < 500) return;
+
                             const incomingRev = parseInt(revStr, 10);
-                            const b64 = line.substring(secondColon + 6);
+                            const b64 = line.substring(textMarker + 6);
                             const incomingText = decodeURIComponent(escape(atob(b64)));
 
-                            // Live synchronization
-                            if (incomingRev > remoteRevision && editor.value !== incomingText) {
-                                remoteRevision = incomingRev;
-                                localRevision = incomingRev;
+                            if (editor.value !== incomingText) {
+                                remoteRevision = Math.max(remoteRevision, incomingRev);
+                                localRevision = Math.max(localRevision, incomingRev);
 
                                 isApplyingRemote = true;
                                 const selStart = editor.selectionStart;
                                 const selEnd = editor.selectionEnd;
 
                                 editor.value = incomingText;
-                                editor.setSelectionRange(selStart, selEnd);
+                                const safeStart = Math.min(selStart, editor.value.length);
+                                const safeEnd = Math.min(selEnd, editor.value.length);
+                                editor.setSelectionRange(safeStart, safeEnd);
                                 isApplyingRemote = false;
                                 updateStats();
 
