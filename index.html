@@ -4,6 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>Cloud Notepad (Mobile Twin)</title>
+    <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
         body {
@@ -159,7 +160,6 @@
         const editor = document.getElementById('editor');
         const statusIndicator = document.getElementById('statusIndicator');
         const syncBadge = document.getElementById('syncBadge');
-        const affinityBadge = document.getElementById('affinityBadge');
         const charCount = document.getElementById('charCount');
 
         let localRevision = 0;
@@ -167,16 +167,23 @@
         let isApplyingRemote = false;
         let broadcastTimer = null;
         let lastLocalEdit = 0;
-        let currentAffinity = "0x00";
-        let eventSource = null;
+        let mqttClient = null;
 
         function setChannel() {
-            channel = document.getElementById('channelInput').value.trim();
-            localStorage.setItem('twin_channel', channel);
-            localRevision = 0;
-            remoteRevision = 0;
-            fetchInitialState();
-            restartStream();
+            const newChannel = document.getElementById('channelInput').value.trim();
+            if (!newChannel) return;
+            if (mqttClient) {
+                mqttClient.unsubscribe(`twin_notepad/${channel}`);
+                channel = newChannel;
+                localStorage.setItem('twin_channel', channel);
+                localRevision = 0;
+                remoteRevision = 0;
+                mqttClient.subscribe(`twin_notepad/${channel}`);
+            } else {
+                channel = newChannel;
+                localStorage.setItem('twin_channel', channel);
+                connectMQTT();
+            }
         }
 
         // Live Bi-directional Typing Listener
@@ -189,7 +196,7 @@
             clearTimeout(broadcastTimer);
             broadcastTimer = setTimeout(() => {
                 broadcastLocalChange();
-            }, 250); // 250ms debounce: sends entire text document in 1 burst
+            }, 250);
         });
 
         function updateStats() {
@@ -197,153 +204,94 @@
         }
 
         function broadcastLocalChange() {
+            if (!mqttClient || !mqttClient.connected) return;
             const text = editor.value;
             const rev = localRevision;
-
-            // Unicode safe base64
             const b64 = btoa(unescape(encodeURIComponent(text)));
             const packet = `REV:${rev}:FROM:${clientId}:TEXT:${b64}`;
 
-            publishPayload(packet);
+            mqttClient.publish(`twin_notepad/${channel}`, packet, { retain: true, qos: 0 });
             syncBadge.textContent = "↑ PUSHING...";
             setTimeout(() => { syncBadge.textContent = "● LIVE"; }, 250);
         }
 
-        async function publishPayload(payload) {
-            try {
-                await fetch(`https://ntfy.sh/${channel}`, {
-                    method: 'POST',
-                    body: payload
-                });
-            } catch (err) {
-                console.error("Sync error:", err);
-            }
-        }
-
-        function toggleAffinity() {
-            currentAffinity = (currentAffinity === '0x11') ? '0x00' : '0x11';
-            affinityBadge.textContent = `WDA: ${currentAffinity}`;
-            publishPayload(`CMD:AFFINITY:${currentAffinity}`);
-        }
-
-        // Fetch current text immediately upon opening
-        async function fetchInitialState() {
-            try {
-                const res = await fetch(`https://ntfy.sh/${channel}/raw?poll=1`);
-                if (res.ok) {
-                    const textData = await res.text();
-                    const lines = textData.split('\n');
-                    let latestText = null;
-                    let highestRev = 0;
-
-                    for (const line of lines) {
-                        if (line.startsWith("REV:")) {
-                            const firstColon = 4;
-                            const secondColon = line.indexOf(":TEXT:", firstColon);
-                            if (secondColon !== -1) {
-                                const rev = parseInt(line.substring(firstColon, secondColon), 10);
-                                if (rev >= highestRev) {
-                                    highestRev = rev;
-                                    const b64 = line.substring(secondColon + 6);
-                                    latestText = decodeURIComponent(escape(atob(b64)));
-                                }
-                            }
-                        }
-                    }
-
-                    if (latestText !== null) {
-                        isApplyingRemote = true;
-                        remoteRevision = highestRev;
-                        localRevision = highestRev;
-                        editor.value = latestText;
-                        isApplyingRemote = false;
-                        updateStats();
-                    }
-                }
-            } catch (e) {
-                console.error("Initial load error:", e);
-            }
-        }
-
-        // Live streaming without needing page reload
-        function restartStream() {
-            if (eventSource) {
-                eventSource.close();
+        function connectMQTT() {
+            if (mqttClient) {
+                mqttClient.end(true);
             }
 
-            // Real-time EventSource connection
-            const streamUrl = `https://ntfy.sh/${channel}/sse`;
-            eventSource = new EventSource(streamUrl);
+            statusIndicator.textContent = "Connecting to MQTT...";
+            statusIndicator.style.color = "#f59e0b";
 
-            eventSource.onopen = () => {
-                statusIndicator.textContent = "Live Stream Active";
+            mqttClient = mqtt.connect('wss://broker.emqx.io:8084/mqtt', {
+                clientId: clientId,
+                clean: true,
+                reconnectPeriod: 2000
+            });
+
+            mqttClient.on('connect', () => {
+                statusIndicator.textContent = "MQTT Connected (No Rate Limit)";
                 statusIndicator.style.color = "#4ade80";
-            };
+                syncBadge.textContent = "● LIVE";
+                mqttClient.subscribe(`twin_notepad/${channel}`);
+            });
 
-            eventSource.onmessage = (event) => {
+            mqttClient.on('message', (topic, message) => {
                 try {
-                    const data = JSON.parse(event.data);
-                    const line = data.message;
-                    if (!line) return;
+                    const line = message.toString();
+                    if (!line.startsWith("REV:")) return;
 
-                    if (line.StartsWith && line.startsWith("CMD:AFFINITY:")) {
-                        const aff = line.replace("CMD:AFFINITY:", "").trim();
-                        currentAffinity = aff;
-                        affinityBadge.textContent = `WDA: ${aff}`;
-                    } else if (line.startsWith("REV:")) {
-                        const firstColon = 4;
-                        const textMarker = line.indexOf(":TEXT:", firstColon);
-                        if (textMarker !== -1) {
-                            let senderId = "";
-                            const fromMarker = line.indexOf(":FROM:", firstColon);
-                            let revStr;
-                            if (fromMarker !== -1 && fromMarker < textMarker) {
-                                revStr = line.substring(firstColon, fromMarker);
-                                senderId = line.substring(fromMarker + 6, textMarker);
-                            } else {
-                                revStr = line.substring(firstColon, textMarker);
-                            }
+                    const firstColon = 4;
+                    const textMarker = line.indexOf(":TEXT:", firstColon);
+                    if (textMarker !== -1) {
+                        let senderId = "";
+                        const fromMarker = line.indexOf(":FROM:", firstColon);
+                        let revStr;
+                        if (fromMarker !== -1 && fromMarker < textMarker) {
+                            revStr = line.substring(firstColon, fromMarker);
+                            senderId = line.substring(fromMarker + 6, textMarker);
+                        } else {
+                            revStr = line.substring(firstColon, textMarker);
+                        }
 
-                            if (senderId === clientId) return;
-                            if (Date.now() - lastLocalEdit < 500) return;
+                        if (senderId === clientId) return;
+                        if (Date.now() - lastLocalEdit < 500) return;
 
-                            const incomingRev = parseInt(revStr, 10);
-                            const b64 = line.substring(textMarker + 6);
-                            const incomingText = decodeURIComponent(escape(atob(b64)));
+                        const incomingRev = parseInt(revStr, 10);
+                        const b64 = line.substring(textMarker + 6);
+                        const incomingText = decodeURIComponent(escape(atob(b64)));
 
-                            if (editor.value !== incomingText) {
-                                remoteRevision = Math.max(remoteRevision, incomingRev);
-                                localRevision = Math.max(localRevision, incomingRev);
+                        if (editor.value !== incomingText) {
+                            remoteRevision = Math.max(remoteRevision, incomingRev);
+                            localRevision = Math.max(localRevision, incomingRev);
 
-                                isApplyingRemote = true;
-                                const selStart = editor.selectionStart;
-                                const selEnd = editor.selectionEnd;
+                            isApplyingRemote = true;
+                            const selStart = editor.selectionStart;
+                            const selEnd = editor.selectionEnd;
 
-                                editor.value = incomingText;
-                                const safeStart = Math.min(selStart, editor.value.length);
-                                const safeEnd = Math.min(selEnd, editor.value.length);
-                                editor.setSelectionRange(safeStart, safeEnd);
-                                isApplyingRemote = false;
-                                updateStats();
+                            editor.value = incomingText;
+                            const safeStart = Math.min(selStart, editor.value.length);
+                            const safeEnd = Math.min(selEnd, editor.value.length);
+                            editor.setSelectionRange(safeStart, safeEnd);
+                            isApplyingRemote = false;
+                            updateStats();
 
-                                syncBadge.textContent = "↓ RECEIVED";
-                                setTimeout(() => { syncBadge.textContent = "● LIVE"; }, 250);
-                            }
+                            syncBadge.textContent = "↓ RECEIVED";
+                            setTimeout(() => { syncBadge.textContent = "● LIVE"; }, 250);
                         }
                     }
                 } catch (e) {
-                    console.error("Stream parse error:", e);
+                    console.error("MQTT parse error:", e);
                 }
-            };
+            });
 
-            eventSource.onerror = () => {
+            mqttClient.on('reconnect', () => {
                 statusIndicator.textContent = "Reconnecting...";
                 statusIndicator.style.color = "#f59e0b";
-            };
+            });
         }
 
-        fetchInitialState();
-        restartStream();
+        connectMQTT();
     </script>
 </body>
 </html>
