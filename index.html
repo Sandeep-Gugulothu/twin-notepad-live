@@ -132,14 +132,14 @@
             <span>📝 Cloud Notepad (Mobile Twin)</span>
         </div>
         <div class="badges">
-            <span id="affinityBadge" class="badge badge-affinity" onclick="toggleAffinity()">WDA: 0x11</span>
-            <span id="syncBadge" class="badge badge-live">● LIVE</span>
+            <span id="affinityBadge" class="badge badge-affinity" onclick="toggleAffinity()">WDA: 0x00</span>
+            <span id="syncBadge" class="badge badge-live">● CONNECTED</span>
         </div>
     </div>
 
     <div class="channel-bar">
         <span style="color:#888;">Room:</span>
-        <input type="text" id="channelInput" value="notepad_room_8821">
+        <input type="text" id="channelInput" value="twin_notepad_room_77">
         <button onclick="setChannel()">Join</button>
     </div>
 
@@ -153,8 +153,7 @@
     </div>
 
     <script>
-        const clientId = 'mob_' + Math.random().toString(36).substring(2, 8);
-        let channel = localStorage.getItem('twin_channel') || 'notepad_room_8821';
+        let channel = localStorage.getItem('twin_channel') || 'twin_notepad_room_77';
         document.getElementById('channelInput').value = channel;
 
         const editor = document.getElementById('editor');
@@ -163,26 +162,30 @@
         const affinityBadge = document.getElementById('affinityBadge');
         const charCount = document.getElementById('charCount');
 
+        let localRevision = 0;
+        let remoteRevision = 0;
         let isApplyingRemote = false;
         let broadcastTimer = null;
-        let currentAffinity = "0x11";
+        let currentAffinity = "0x00";
         let eventSource = null;
 
         function setChannel() {
             channel = document.getElementById('channelInput').value.trim();
             localStorage.setItem('twin_channel', channel);
+            fetchInitialState();
             restartStream();
         }
 
         // Live Bi-directional Typing Listener
         editor.addEventListener('input', () => {
             if (isApplyingRemote) return;
+            localRevision++;
             updateStats();
 
             clearTimeout(broadcastTimer);
             broadcastTimer = setTimeout(() => {
                 broadcastLocalChange();
-            }, 100);
+            }, 120);
         });
 
         function updateStats() {
@@ -191,13 +194,15 @@
 
         function broadcastLocalChange() {
             const text = editor.value;
+            const rev = localRevision;
+
             // Unicode safe base64
             const b64 = btoa(unescape(encodeURIComponent(text)));
-            const packet = `SENDER:${clientId}:TEXT:${b64}`;
+            const packet = `REV:${rev}:TEXT:${b64}`;
 
             publishPayload(packet);
             syncBadge.textContent = "↑ PUSHING...";
-            setTimeout(() => { syncBadge.textContent = "● LIVE"; }, 250);
+            setTimeout(() => { syncBadge.textContent = "● SYNCED"; }, 300);
         }
 
         async function publishPayload(payload) {
@@ -217,13 +222,51 @@
             publishPayload(`CMD:AFFINITY:${currentAffinity}`);
         }
 
-        // Live stream with NO old message history replay
+        // Fetch current text immediately upon opening
+        async function fetchInitialState() {
+            try {
+                const res = await fetch(`https://ntfy.sh/${channel}/raw?poll=1`);
+                if (res.ok) {
+                    const textData = await res.text();
+                    const lines = textData.split('\n');
+                    let latestText = null;
+                    let highestRev = 0;
+
+                    for (const line of lines) {
+                        if (line.startsWith("REV:")) {
+                            const firstColon = 4;
+                            const secondColon = line.indexOf(":TEXT:", firstColon);
+                            if (secondColon !== -1) {
+                                const rev = parseInt(line.substring(firstColon, secondColon), 10);
+                                if (rev >= highestRev) {
+                                    highestRev = rev;
+                                    const b64 = line.substring(secondColon + 6);
+                                    latestText = decodeURIComponent(escape(atob(b64)));
+                                }
+                            }
+                        }
+                    }
+
+                    if (latestText !== null) {
+                        isApplyingRemote = true;
+                        remoteRevision = highestRev;
+                        localRevision = highestRev;
+                        editor.value = latestText;
+                        isApplyingRemote = false;
+                        updateStats();
+                    }
+                }
+            } catch (e) {
+                console.error("Initial load error:", e);
+            }
+        }
+
+        // Live stream without cache lag
         function restartStream() {
             if (eventSource) {
                 eventSource.close();
             }
 
-            // ?since=now ignores historical backlogs so both devices always mirror the current state
             const streamUrl = `https://ntfy.sh/${channel}/sse?since=now`;
             eventSource = new EventSource(streamUrl);
 
@@ -242,17 +285,19 @@
                         const aff = line.replace("CMD:AFFINITY:", "").trim();
                         currentAffinity = aff;
                         affinityBadge.textContent = `WDA: ${aff}`;
-                    } else if (line.startsWith("SENDER:")) {
-                        const firstColon = 7;
+                    } else if (line.startsWith("REV:")) {
+                        const firstColon = 4;
                         const secondColon = line.indexOf(":TEXT:", firstColon);
                         if (secondColon !== -1) {
-                            const sender = line.substring(firstColon, secondColon);
-                            if (sender === clientId) return; // Don't echo self
-
+                            const revStr = line.substring(firstColon, secondColon);
+                            const incomingRev = parseInt(revStr, 10);
                             const b64 = line.substring(secondColon + 6);
                             const incomingText = decodeURIComponent(escape(atob(b64)));
 
-                            if (editor.value !== incomingText) {
+                            if (incomingRev > remoteRevision && editor.value !== incomingText) {
+                                remoteRevision = incomingRev;
+                                localRevision = incomingRev;
+
                                 isApplyingRemote = true;
                                 const selStart = editor.selectionStart;
                                 const selEnd = editor.selectionEnd;
@@ -263,33 +308,12 @@
                                 updateStats();
 
                                 syncBadge.textContent = "↓ RECEIVED";
-                                setTimeout(() => { syncBadge.textContent = "● LIVE"; }, 250);
-                            }
-                        }
-                    } else if (line.startsWith("REV:")) {
-                        // Compatibility with REV packets
-                        const textIdx = line.indexOf(":TEXT:");
-                        if (textIdx !== -1) {
-                            const b64 = line.substring(textIdx + 6);
-                            const incomingText = decodeURIComponent(escape(atob(b64)));
-
-                            if (editor.value !== incomingText) {
-                                isApplyingRemote = true;
-                                const selStart = editor.selectionStart;
-                                const selEnd = editor.selectionEnd;
-
-                                editor.value = incomingText;
-                                editor.setSelectionRange(selStart, selEnd);
-                                isApplyingRemote = false;
-                                updateStats();
-
-                                syncBadge.textContent = "↓ RECEIVED";
-                                setTimeout(() => { syncBadge.textContent = "● LIVE"; }, 250);
+                                setTimeout(() => { syncBadge.textContent = "● SYNCED"; }, 300);
                             }
                         }
                     }
                 } catch (e) {
-                    console.error("Stream parse error:", e);
+                    console.error("Stream error:", e);
                 }
             };
 
@@ -299,6 +323,7 @@
             };
         }
 
+        fetchInitialState();
         restartStream();
     </script>
 </body>
