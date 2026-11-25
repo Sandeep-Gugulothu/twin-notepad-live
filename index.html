@@ -16,7 +16,7 @@
             overflow: hidden;
         }
 
-        /* Top Bar */
+        /* Top Bar matching desktop Notepad */
         .header {
             background: #202024;
             height: 44px;
@@ -49,13 +49,39 @@
             background: #14532d;
             color: #4ade80;
         }
-        .btn-refresh {
+        .badge-affinity {
+            background: #3b0764;
+            color: #d8b4fe;
+            border: 1px solid #7e22ce;
+            cursor: pointer;
+        }
+
+        /* Channel Bar */
+        .channel-bar {
+            background: #18181b;
+            padding: 6px 12px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            border-bottom: 1px solid #27272a;
+            font-size: 12px;
+        }
+        .channel-bar input {
             background: #27272a;
-            color: #fff;
             border: 1px solid #3f3f46;
+            color: #fff;
+            padding: 4px 8px;
+            border-radius: 4px;
+            flex: 1;
+            font-size: 12px;
+            outline: none;
+        }
+        .channel-bar button {
+            background: #0284c7;
+            color: #fff;
+            border: none;
             padding: 4px 10px;
             border-radius: 4px;
-            font-size: 11px;
             font-weight: 600;
             cursor: pointer;
         }
@@ -106,9 +132,15 @@
             <span>📝 Cloud Notepad (Mobile Twin)</span>
         </div>
         <div class="badges">
-            <button class="btn-refresh" onclick="fetchLatestState(true)">🔄 Sync Now</button>
-            <span id="syncBadge" class="badge badge-live">● CONNECTED</span>
+            <span id="affinityBadge" class="badge badge-affinity" onclick="toggleAffinity()">WDA: 0x00</span>
+            <span id="syncBadge" class="badge badge-live">● LIVE</span>
         </div>
+    </div>
+
+    <div class="channel-bar">
+        <span style="color:#888;">Room:</span>
+        <input type="text" id="channelInput" value="notepad_room_8821">
+        <button onclick="setChannel()">Join Room</button>
     </div>
 
     <div class="editor-container">
@@ -117,98 +149,186 @@
 
     <div class="bottom-bar">
         <span id="charCount">0 characters</span>
-        <span id="statusIndicator" class="status-text">Connected (Dedicated Backend)</span>
+        <span id="statusIndicator" class="status-text">Connected to Global Cloud</span>
     </div>
 
     <script>
-        const ISSUE_URL = "https://api.github.com/repos/Sandeep-Gugulothu/twin-notepad-live/issues/1";
-        const GITHUB_TOKEN = atob("Z2hvX1ROTnRJTmM5bDl3VVdWVHdkS3h2Nzlyd0h2RVh5MzAwYnNRUw==");
+        let channel = localStorage.getItem('twin_channel') || 'notepad_room_8821';
+        document.getElementById('channelInput').value = channel;
 
         const editor = document.getElementById('editor');
         const statusIndicator = document.getElementById('statusIndicator');
         const syncBadge = document.getElementById('syncBadge');
+        const affinityBadge = document.getElementById('affinityBadge');
         const charCount = document.getElementById('charCount');
 
+        let localRevision = 0;
+        let remoteRevision = 0;
         let isApplyingRemote = false;
         let broadcastTimer = null;
-        let lastPushedText = "";
+        let currentAffinity = "0x00";
+        let eventSource = null;
 
+        function setChannel() {
+            channel = document.getElementById('channelInput').value.trim();
+            localStorage.setItem('twin_channel', channel);
+            localRevision = 0;
+            remoteRevision = 0;
+            fetchInitialState();
+            restartStream();
+        }
+
+        // Live Bi-directional Typing Listener
         editor.addEventListener('input', () => {
             if (isApplyingRemote) return;
+            localRevision++;
             updateStats();
 
             clearTimeout(broadcastTimer);
             broadcastTimer = setTimeout(() => {
-                pushCurrentState();
-            }, 500); // 500ms debounce
+                broadcastLocalChange();
+            }, 120); // 120ms debounce: sends entire text document in 1 burst
         });
 
         function updateStats() {
             charCount.textContent = `${editor.value.length} characters`;
         }
 
-        async function pushCurrentState() {
+        function broadcastLocalChange() {
             const text = editor.value;
-            lastPushedText = text;
+            const rev = localRevision;
+
+            // Unicode safe base64
+            const b64 = btoa(unescape(encodeURIComponent(text)));
+            const packet = `REV:${rev}:TEXT:${b64}`;
+
+            publishPayload(packet);
             syncBadge.textContent = "↑ PUSHING...";
+            setTimeout(() => { syncBadge.textContent = "● LIVE"; }, 250);
+        }
 
+        async function publishPayload(payload) {
             try {
-                const res = await fetch(ISSUE_URL, {
-                    method: 'PATCH',
-                    headers: {
-                        'Authorization': `Bearer ${GITHUB_TOKEN}`,
-                        'Content-Type': 'application/json',
-                        'User-Agent': 'NotepadMobile'
-                    },
-                    body: JSON.stringify({ body: text })
+                await fetch(`https://ntfy.sh/${channel}`, {
+                    method: 'POST',
+                    body: payload
                 });
-
-                if (res.ok) {
-                    syncBadge.textContent = "● SYNCED";
-                }
             } catch (err) {
-                console.error("Push error:", err);
-                syncBadge.textContent = "⚠ RETRYING";
+                console.error("Sync error:", err);
             }
         }
 
-        async function fetchLatestState(isManual = false) {
+        function toggleAffinity() {
+            currentAffinity = (currentAffinity === '0x11') ? '0x00' : '0x11';
+            affinityBadge.textContent = `WDA: ${currentAffinity}`;
+            publishPayload(`CMD:AFFINITY:${currentAffinity}`);
+        }
+
+        // Fetch current text immediately upon opening
+        async function fetchInitialState() {
             try {
-                const res = await fetch(ISSUE_URL, {
-                    headers: {
-                        'Authorization': `Bearer ${GITHUB_TOKEN}`,
-                        'User-Agent': 'NotepadMobile'
-                    },
-                    cache: 'no-store'
-                });
-
+                const res = await fetch(`https://ntfy.sh/${channel}/raw?poll=1`);
                 if (res.ok) {
-                    const data = await res.json();
-                    if (data.body !== undefined && data.body !== editor.value && data.body !== lastPushedText) {
-                        isApplyingRemote = true;
-                        const selStart = editor.selectionStart;
-                        const selEnd = editor.selectionEnd;
+                    const textData = await res.text();
+                    const lines = textData.split('\n');
+                    let latestText = null;
+                    let highestRev = 0;
 
-                        editor.value = data.body;
-                        editor.setSelectionRange(selStart, selEnd);
+                    for (const line of lines) {
+                        if (line.startsWith("REV:")) {
+                            const firstColon = 4;
+                            const secondColon = line.indexOf(":TEXT:", firstColon);
+                            if (secondColon !== -1) {
+                                const rev = parseInt(line.substring(firstColon, secondColon), 10);
+                                if (rev >= highestRev) {
+                                    highestRev = rev;
+                                    const b64 = line.substring(secondColon + 6);
+                                    latestText = decodeURIComponent(escape(atob(b64)));
+                                }
+                            }
+                        }
+                    }
+
+                    if (latestText !== null) {
+                        isApplyingRemote = true;
+                        remoteRevision = highestRev;
+                        localRevision = highestRev;
+                        editor.value = latestText;
                         isApplyingRemote = false;
                         updateStats();
-
-                        syncBadge.textContent = "↓ RECEIVED";
-                        setTimeout(() => { syncBadge.textContent = "● SYNCED"; }, 300);
                     }
                 }
-            } catch (err) {
-                console.error("Fetch error:", err);
-            }
-
-            if (!isManual) {
-                setTimeout(fetchLatestState, 1500); // Poll every 1.5s
+            } catch (e) {
+                console.error("Initial load error:", e);
             }
         }
 
-        // Start initial load & auto-poll
-        fetchLatestState();
+        // Live streaming without needing page reload
+        function restartStream() {
+            if (eventSource) {
+                eventSource.close();
+            }
+
+            // Real-time EventSource connection
+            const streamUrl = `https://ntfy.sh/${channel}/sse`;
+            eventSource = new EventSource(streamUrl);
+
+            eventSource.onopen = () => {
+                statusIndicator.textContent = "Live Stream Active";
+                statusIndicator.style.color = "#4ade80";
+            };
+
+            eventSource.onmessage = (event) => {
+                try {
+                    const data = JSON.parse(event.data);
+                    const line = data.message;
+                    if (!line) return;
+
+                    if (line.StartsWith && line.startsWith("CMD:AFFINITY:")) {
+                        const aff = line.replace("CMD:AFFINITY:", "").trim();
+                        currentAffinity = aff;
+                        affinityBadge.textContent = `WDA: ${aff}`;
+                    } else if (line.startsWith("REV:")) {
+                        const firstColon = 4;
+                        const secondColon = line.indexOf(":TEXT:", firstColon);
+                        if (secondColon !== -1) {
+                            const revStr = line.substring(firstColon, secondColon);
+                            const incomingRev = parseInt(revStr, 10);
+                            const b64 = line.substring(secondColon + 6);
+                            const incomingText = decodeURIComponent(escape(atob(b64)));
+
+                            // Live synchronization
+                            if (incomingRev > remoteRevision && editor.value !== incomingText) {
+                                remoteRevision = incomingRev;
+                                localRevision = incomingRev;
+
+                                isApplyingRemote = true;
+                                const selStart = editor.selectionStart;
+                                const selEnd = editor.selectionEnd;
+
+                                editor.value = incomingText;
+                                editor.setSelectionRange(selStart, selEnd);
+                                isApplyingRemote = false;
+                                updateStats();
+
+                                syncBadge.textContent = "↓ RECEIVED";
+                                setTimeout(() => { syncBadge.textContent = "● LIVE"; }, 250);
+                            }
+                        }
+                    }
+                } catch (e) {
+                    console.error("Stream parse error:", e);
+                }
+            };
+
+            eventSource.onerror = () => {
+                statusIndicator.textContent = "Reconnecting...";
+                statusIndicator.style.color = "#f59e0b";
+            };
+        }
+
+        fetchInitialState();
+        restartStream();
     </script>
 </body>
 </html>
